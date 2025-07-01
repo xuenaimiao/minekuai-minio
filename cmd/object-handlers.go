@@ -992,7 +992,6 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	logger.Info("处理对象下载请求: %s/%s, 未入isOneTimeTokenValid一次性令牌有效: %t", bucket, object, isOneTimeTokenValid)
 
 	if !globalAPIConfig.shouldGzipObjects() {
 		w.Header().Set(gzhttp.HeaderNoCompression, "true")
