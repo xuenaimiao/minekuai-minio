@@ -966,6 +966,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 
 	// 检查是否是一次性下载令牌请求
 	oneTimeToken := r.URL.Query().Get("one-time-token")
+	logger.Info("处理一次性下载令牌请求: %s/%s, 令牌: %s", bucket, object, oneTimeToken)
 	isOneTimeTokenValid := false
 	if oneTimeToken != "" {
 		// 验证并消费一次性令牌
@@ -985,11 +986,13 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 				return
 			}
 		} else {
+			logger.Info("一次性下载管理器未初始化，无法处理令牌: %s/%s", bucket, object)
 			// 一次性下载管理器未初始化
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
 			return
 		}
 	}
+	logger.Info("处理对象下载请求: %s/%s, 未入isOneTimeTokenValid一次性令牌有效: %t", bucket, object, isOneTimeTokenValid)
 
 	if !globalAPIConfig.shouldGzipObjects() {
 		w.Header().Set(gzhttp.HeaderNoCompression, "true")
@@ -998,7 +1001,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(object, archivePattern) {
 		api.getObjectInArchiveFileHandler(ctx, objectAPI, bucket, object, w, r)
 	} else {
-		api.getObjectHandlerWithAuth(ctx, objectAPI, bucket, object, w, r, !isOneTimeTokenValid)
+		api.getObjectHandlerWithAuth(ctx, objectAPI, bucket, object, w, r, isOneTimeTokenValid)
 	}
 }
 
