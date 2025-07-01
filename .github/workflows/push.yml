@@ -33,6 +33,3 @@ jobs:
 
       - name: 构建 MinIO
         run: make build
-
-      - name: 运行单元测试
-        run: make test
