@@ -1001,7 +1001,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(object, archivePattern) {
 		api.getObjectInArchiveFileHandler(ctx, objectAPI, bucket, object, w, r)
 	} else {
-		api.getObjectHandlerWithAuth(ctx, objectAPI, bucket, object, w, r, isOneTimeTokenValid)
+		api.getObjectHandlerWithAuth(ctx, objectAPI, bucket, object, w, r, !isOneTimeTokenValid)
 	}
 }
 
