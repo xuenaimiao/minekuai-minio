@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -321,9 +320,9 @@ func (api objectAPIHandlers) CreateOneTimeDownloadHandler(w http.ResponseWriter,
 	token := globalOneTimeDownloadManager.CreateOneTimeDownloadToken(bucket, object, createdBy, expiresIn, maxUses)
 
 	// 生成下载URL
-	downloadURL := fmt.Sprintf("%s/%s/%s?one-time-token=%s",
+	downloadURL := fmt.Sprintf("%s?one-time-token=%s",
 		getObjectLocation(r, globalDomainNames, bucket, object),
-		bucket, url.QueryEscape(object), token.Token)
+		token.Token)
 
 	response := OneTimeDownloadResponse{
 		DownloadURL: downloadURL,

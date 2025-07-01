@@ -576,6 +576,238 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 	})
 }
 
+// getObjectHandlerWithAuth - wrapper for getObjectHandler with optional auth bypass
+func (api objectAPIHandlers) getObjectHandlerWithAuth(ctx context.Context, objectAPI ObjectLayer, bucket, object string, w http.ResponseWriter, r *http.Request, requireAuth bool) {
+	if requireAuth {
+		// 使用原始的getObjectHandler进行完整的权限验证
+		api.getObjectHandler(ctx, objectAPI, bucket, object, w, r)
+		return
+	}
+
+	// 跳过权限验证的版本
+	api.getObjectHandlerNoAuth(ctx, objectAPI, bucket, object, w, r)
+}
+
+// getObjectHandlerNoAuth - getObjectHandler without authentication checks for one-time tokens
+func (api objectAPIHandlers) getObjectHandlerNoAuth(ctx context.Context, objectAPI ObjectLayer, bucket, object string, w http.ResponseWriter, r *http.Request) {
+	if crypto.S3.IsRequested(r.Header) || crypto.S3KMS.IsRequested(r.Header) { // If SSE-S3 or SSE-KMS present -> AWS fails with undefined error
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrBadRequest), r.URL)
+		return
+	}
+
+	opts, err := getOpts(ctx, r, bucket, object)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	getObjectNInfo := objectAPI.GetObjectNInfo
+
+	// Get request range.
+	var rs *HTTPRangeSpec
+	var rangeErr error
+	rangeHeader := r.Header.Get(xhttp.Range)
+	if rangeHeader != "" {
+		// Both 'Range' and 'partNumber' cannot be specified at the same time
+		if opts.PartNumber > 0 {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidRangePartNumber), r.URL)
+			return
+		}
+
+		rs, rangeErr = parseRequestRangeSpec(rangeHeader)
+		// Handle only errInvalidRange. Ignore other
+		// parse error and treat it as regular Get
+		// request like Amazon S3.
+		if errors.Is(rangeErr, errInvalidRange) {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidRange), r.URL)
+			return
+		}
+	}
+
+	// Validate pre-conditions if any - skip auth checks
+	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+		if _, err := DecryptObjectInfo(&oi, r); err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return true
+		}
+
+		if oi.UserTags != "" {
+			r.Header.Set(xhttp.AmzObjectTagging, oi.UserTags)
+		}
+
+		// Skip authorization check for one-time tokens
+		return checkPreconditions(ctx, w, r, oi, opts)
+	}
+
+	opts.FastGetObjInfo = true
+
+	var proxy proxyResult
+	gr, err := getObjectNInfo(ctx, bucket, object, rs, r.Header, opts)
+	if err != nil {
+		var (
+			reader *GetObjectReader
+			perr   error
+		)
+
+		if (isErrObjectNotFound(err) || isErrVersionNotFound(err) || isErrReadQuorum(err)) && (gr == nil || !gr.ObjInfo.DeleteMarker) {
+			proxytgts := getProxyTargets(ctx, bucket, object, opts)
+			if !proxytgts.Empty() {
+				globalReplicationStats.Load().incProxy(bucket, getObjectAPI, false)
+				// proxy to replication target if active-active replication is in place.
+				reader, proxy, perr = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
+				if perr != nil {
+					globalReplicationStats.Load().incProxy(bucket, getObjectAPI, true)
+					proxyGetErr := ErrorRespToObjectError(perr, bucket, object)
+					if !isErrBucketNotFound(proxyGetErr) && !isErrObjectNotFound(proxyGetErr) && !isErrVersionNotFound(proxyGetErr) &&
+						!isErrPreconditionFailed(proxyGetErr) && !isErrInvalidRange(proxyGetErr) {
+						replLogIf(ctx, fmt.Errorf("Proxying request (replication) failed for %s/%s(%s) - %w", bucket, object, opts.VersionID, perr))
+					}
+				}
+				if reader != nil && proxy.Proxy && perr == nil {
+					gr = reader
+				}
+			}
+		}
+		if reader == nil || !proxy.Proxy {
+			// Skip authorization check for one-time tokens
+			if isErrPreconditionFailed(err) {
+				return
+			}
+			if proxy.Err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, proxy.Err), r.URL)
+				return
+			}
+			if gr != nil {
+				if !gr.ObjInfo.VersionPurgeStatus.Empty() {
+					// Shows the replication status of a permanent delete of a version
+					w.Header()[xhttp.MinIODeleteReplicationStatus] = []string{string(gr.ObjInfo.VersionPurgeStatus)}
+				}
+				if !gr.ObjInfo.ReplicationStatus.Empty() && gr.ObjInfo.DeleteMarker {
+					w.Header()[xhttp.MinIODeleteMarkerReplicationStatus] = []string{string(gr.ObjInfo.ReplicationStatus)}
+				}
+
+				// Versioning enabled quite possibly object is deleted might be delete-marker
+				// if present set the headers, no idea why AWS S3 sets these headers.
+				if gr.ObjInfo.VersionID != "" && gr.ObjInfo.DeleteMarker {
+					w.Header()[xhttp.AmzVersionID] = []string{gr.ObjInfo.VersionID}
+					w.Header()[xhttp.AmzDeleteMarker] = []string{strconv.FormatBool(gr.ObjInfo.DeleteMarker)}
+				}
+				QueueReplicationHeal(ctx, bucket, gr.ObjInfo, 0)
+			}
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+	}
+	defer gr.Close()
+
+	objInfo := gr.ObjInfo
+
+	if !proxy.Proxy { // apply lifecycle rules only for local requests
+		// Automatically remove the object/version if an expiry lifecycle rule can be applied
+		if lc, err := globalLifecycleSys.Get(bucket); err == nil {
+			rcfg, err := globalBucketObjectLockSys.Get(bucket)
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
+			replcfg, err := getReplicationConfig(ctx, bucket)
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
+			event := evalActionFromLifecycle(ctx, *lc, rcfg, replcfg, objInfo)
+			if event.Action.Delete() {
+				// apply whatever the expiry rule is.
+				applyExpiryRule(event, lcEventSrc_s3GetObject, objInfo)
+				if !event.Action.DeleteRestored() {
+					// If the ILM action is not on restored object return error.
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNoSuchKey), r.URL)
+					return
+				}
+			}
+		}
+
+		QueueReplicationHeal(ctx, bucket, gr.ObjInfo, 0)
+	}
+
+	// filter object lock metadata - skip auth checks for one-time tokens
+	objInfo.UserDefined = objectlock.FilterObjectLockMetadata(objInfo.UserDefined, true, true)
+
+	// Set encryption response headers
+	if kind, isEncrypted := crypto.IsEncrypted(objInfo.UserDefined); isEncrypted {
+		switch kind {
+		case crypto.S3:
+			w.Header().Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
+		case crypto.S3KMS:
+			w.Header().Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
+			w.Header().Set(xhttp.AmzServerSideEncryptionKmsID, objInfo.KMSKeyID())
+			if kmsCtx, ok := objInfo.UserDefined[crypto.MetaContext]; ok {
+				w.Header().Set(xhttp.AmzServerSideEncryptionKmsContext, kmsCtx)
+			}
+		case crypto.SSEC:
+			w.Header().Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, r.Header.Get(xhttp.AmzServerSideEncryptionCustomerAlgorithm))
+			w.Header().Set(xhttp.AmzServerSideEncryptionCustomerKeyMD5, r.Header.Get(xhttp.AmzServerSideEncryptionCustomerKeyMD5))
+		}
+		objInfo.ETag = getDecryptedETag(r.Header, objInfo, false)
+	}
+
+	if r.Header.Get(xhttp.AmzChecksumMode) == "ENABLED" && rs == nil {
+		// AWS S3 silently drops checksums on range requests.
+		cs, _ := objInfo.decryptChecksums(opts.PartNumber, r.Header)
+		hash.AddChecksumHeader(w, cs)
+	}
+
+	if err = setObjectHeaders(ctx, w, objInfo, rs, opts); err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	// Set Parts Count Header
+	if opts.PartNumber > 0 && len(objInfo.Parts) > 0 {
+		setPartsCountHeaders(w, objInfo)
+	}
+
+	setHeadGetRespHeaders(w, r.Form)
+
+	var iw io.Writer = w
+
+	statusCodeWritten := false
+	httpWriter := xioutil.WriteOnClose(iw)
+	if rs != nil || opts.PartNumber > 0 {
+		statusCodeWritten = true
+		w.WriteHeader(http.StatusPartialContent)
+	}
+
+	// Write object content to response body
+	if _, err = xioutil.Copy(httpWriter, gr); err != nil {
+		if !httpWriter.HasWritten() && !statusCodeWritten {
+			// write error response only if no data or headers has been written to client yet
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		return
+	}
+
+	if err = httpWriter.Close(); err != nil {
+		if !httpWriter.HasWritten() && !statusCodeWritten { // write error response only if no data or headers has been written to client yet
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+		return
+	}
+
+	// Notify object accessed via a GET request.
+	sendEvent(eventArgs{
+		EventName:    event.ObjectAccessedGet,
+		BucketName:   bucket,
+		Object:       objInfo,
+		ReqParams:    extractReqParams(r),
+		RespElements: extractRespElements(w),
+		UserAgent:    r.UserAgent(),
+		Host:         handlers.GetSourceIP(r),
+	})
+}
+
 // GetObjectAttributes ...
 func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, objectAPI ObjectLayer, bucket, object string, w http.ResponseWriter, r *http.Request) {
 	opts, valid := getAndValidateAttributesOpts(ctx, w, r, bucket, object)
@@ -734,6 +966,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 
 	// 检查是否是一次性下载令牌请求
 	oneTimeToken := r.URL.Query().Get("one-time-token")
+	isOneTimeTokenValid := false
 	if oneTimeToken != "" {
 		// 验证并消费一次性令牌
 		if globalOneTimeDownloadManager != nil {
@@ -745,6 +978,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 				}
 				// 令牌有效，继续处理下载
 				logger.Info("使用一次性下载令牌访问对象: %s/%s", bucket, object)
+				isOneTimeTokenValid = true
 			} else {
 				// 令牌无效或已过期
 				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
@@ -764,7 +998,7 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(object, archivePattern) {
 		api.getObjectInArchiveFileHandler(ctx, objectAPI, bucket, object, w, r)
 	} else {
-		api.getObjectHandler(ctx, objectAPI, bucket, object, w, r)
+		api.getObjectHandlerWithAuth(ctx, objectAPI, bucket, object, w, r, !isOneTimeTokenValid)
 	}
 }
 
