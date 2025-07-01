@@ -366,6 +366,10 @@ func registerAPIRouter(router *mux.Router) {
 		router.Methods(http.MethodGet).Path("/{object:.+}").
 			HandlerFunc(s3APIMiddleware(api.GetObjectLambdaHandler, traceHdrsS3HFlag)).
 			Queries("lambdaArn", "{lambdaArn:.*}")
+		// Create one-time download token
+		router.Methods(http.MethodPost).Path("/{object:.+}").
+			HandlerFunc(s3APIMiddleware(api.CreateOneTimeDownloadHandler)).
+			Queries("one-time-download", "")
 		// GetObject
 		router.Methods(http.MethodGet).Path("/{object:.+}").
 			HandlerFunc(s3APIMiddleware(api.GetObjectHandler, traceHdrsS3HFlag))

@@ -731,6 +731,32 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+
+	// 检查是否是一次性下载令牌请求
+	oneTimeToken := r.URL.Query().Get("one-time-token")
+	if oneTimeToken != "" {
+		// 验证并消费一次性令牌
+		if globalOneTimeDownloadManager != nil {
+			if tokenInfo, valid := globalOneTimeDownloadManager.ValidateAndConsumeToken(oneTimeToken); valid {
+				// 验证令牌对应的资源是否匹配
+				if tokenInfo.Bucket != bucket || tokenInfo.Object != object {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+					return
+				}
+				// 令牌有效，继续处理下载
+				logger.Info("使用一次性下载令牌访问对象: %s/%s", bucket, object)
+			} else {
+				// 令牌无效或已过期
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+				return
+			}
+		} else {
+			// 一次性下载管理器未初始化
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+			return
+		}
+	}
+
 	if !globalAPIConfig.shouldGzipObjects() {
 		w.Header().Set(gzhttp.HeaderNoCompression, "true")
 	}

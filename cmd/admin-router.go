@@ -433,6 +433,10 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 
 		// STS Revocation
 		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/revoke-tokens/{userProvider}").HandlerFunc(adminMiddleware(adminAPI.RevokeTokens))
+
+		// One-time download management
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/one-time-download/stats").HandlerFunc(adminMiddleware(adminAPI.OneTimeDownloadStatsHandler))
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/one-time-download/revoke").HandlerFunc(adminMiddleware(adminAPI.OneTimeDownloadRevokeHandler))
 	}
 
 	// If none of the routes match add default error handler routes
