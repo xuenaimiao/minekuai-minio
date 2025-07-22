@@ -34,14 +34,16 @@ import (
 
 // OneTimeToken 表示一次性下载令牌
 type OneTimeToken struct {
-	Token     string    `json:"token"`
-	Bucket    string    `json:"bucket"`
-	Object    string    `json:"object"`
-	ExpiresAt time.Time `json:"expires_at"`
-	MaxUses   int       `json:"max_uses"`
-	UsedCount int       `json:"used_count"`
-	CreatedAt time.Time `json:"created_at"`
-	CreatedBy string    `json:"created_by"`
+	Token          string    `json:"token"`
+	Bucket         string    `json:"bucket"`
+	Object         string    `json:"object"`
+	ExpiresAt      time.Time `json:"expires_at"`
+	MaxUses        int       `json:"max_uses"`
+	UsedCount      int       `json:"used_count"`
+	CreatedAt      time.Time `json:"created_at"`
+	CreatedBy      string    `json:"created_by"`
+	FirstUsedAt    time.Time `json:"first_used_at,omitempty"`    // 第一次使用时间
+	UsageExpiresAt time.Time `json:"usage_expires_at,omitempty"` // 使用期限（从第一次使用开始计算）
 }
 
 // OneTimeDownloadManager 管理一次性下载令牌
@@ -136,6 +138,21 @@ func (m *OneTimeDownloadManager) ValidateAndConsumeToken(tokenStr string) (*OneT
 		return nil, false
 	}
 
+	// 如果是第一次使用，设置第一次使用时间和使用期限
+	if token.FirstUsedAt.IsZero() {
+		token.FirstUsedAt = time.Now()
+		token.UsageExpiresAt = token.FirstUsedAt.Add(120 * time.Second) // 120秒后过期
+		token.MaxUses = 3                                               // 设置为最多使用3次
+		logger.Info("令牌首次使用: %s, 使用期限至: %s", tokenStr, token.UsageExpiresAt.Format(time.RFC3339))
+	}
+
+	// 检查是否超过120秒使用期限
+	if time.Now().After(token.UsageExpiresAt) {
+		logger.Info("令牌使用期限已过: %s, usage_expired_at=%s", tokenStr, token.UsageExpiresAt.Format(time.RFC3339))
+		delete(m.tokens, tokenStr)
+		return nil, false
+	}
+
 	// 检查使用次数
 	if token.UsedCount >= token.MaxUses {
 		logger.Info("令牌使用次数已达上限: %s, used=%d, max=%d", tokenStr, token.UsedCount, token.MaxUses)
@@ -145,7 +162,9 @@ func (m *OneTimeDownloadManager) ValidateAndConsumeToken(tokenStr string) (*OneT
 
 	// 增加使用次数
 	token.UsedCount++
-	logger.Info("消费一次性下载令牌: %s, used_count=%d/%d", tokenStr, token.UsedCount, token.MaxUses)
+	logger.Info("消费一次性下载令牌: %s, used_count=%d/%d, 剩余时间=%s",
+		tokenStr, token.UsedCount, token.MaxUses,
+		time.Until(token.UsageExpiresAt).Round(time.Second))
 
 	// 如果使用次数达到上限，删除令牌
 	if token.UsedCount >= token.MaxUses {
@@ -215,6 +234,7 @@ func (m *OneTimeDownloadManager) performCleanup() {
 	now := time.Now()
 	expiredCount := 0
 	usedUpCount := 0
+	usageExpiredCount := 0
 
 	for tokenStr, token := range m.tokens {
 		shouldDelete := false
@@ -225,6 +245,10 @@ func (m *OneTimeDownloadManager) performCleanup() {
 		} else if token.UsedCount >= token.MaxUses {
 			usedUpCount++
 			shouldDelete = true
+		} else if !token.FirstUsedAt.IsZero() && now.After(token.UsageExpiresAt) {
+			// 检查使用期限是否过期
+			usageExpiredCount++
+			shouldDelete = true
 		}
 
 		if shouldDelete {
@@ -232,9 +256,9 @@ func (m *OneTimeDownloadManager) performCleanup() {
 		}
 	}
 
-	if expiredCount > 0 || usedUpCount > 0 {
-		logger.Info("清理一次性下载令牌: expired=%d, used_up=%d, remaining=%d",
-			expiredCount, usedUpCount, len(m.tokens))
+	if expiredCount > 0 || usedUpCount > 0 || usageExpiredCount > 0 {
+		logger.Info("清理一次性下载令牌: expired=%d, used_up=%d, usage_expired=%d, remaining=%d",
+			expiredCount, usedUpCount, usageExpiredCount, len(m.tokens))
 	}
 }
 
@@ -317,7 +341,8 @@ func (api objectAPIHandlers) CreateOneTimeDownloadHandler(w http.ResponseWriter,
 		return
 	}
 
-	token := globalOneTimeDownloadManager.CreateOneTimeDownloadToken(bucket, object, createdBy, expiresIn, maxUses)
+	// 注意：这里创建的令牌会在第一次使用时自动设置为3次使用限制和120秒时间限制
+	token := globalOneTimeDownloadManager.CreateOneTimeDownloadToken(bucket, object, createdBy, expiresIn, 1) // maxUses将在首次使用时被覆盖
 
 	// 生成下载URL
 	downloadURL := fmt.Sprintf("%s?one-time-token=%s",
